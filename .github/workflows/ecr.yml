@@ -2,7 +2,7 @@ name: ECR - Build & Push (after CI on main)
 
 on:
   workflow_run:
-    workflows: ["ci.yml"]   # ← 여기 'CI 워크플로우의 name'을 정확히 넣어줘
+    workflows: ["CI"]   # ← 여기 'CI 워크플로우의 name'을 정확히 넣어줘
     types: [completed]
   workflow_dispatch:
 
