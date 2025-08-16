@@ -2,12 +2,12 @@ name: ECS - Deploy
 
 on:
   workflow_run:
-    workflows: ["ECR - Build & Push"]  # ← ECR 워크플로우 'name' 정확히 입력
+    workflows: ["ECR - Build & Push"]  # ← ECR 워크플로우 name과 정확히 일치
     types: [completed]
   workflow_dispatch:
 
 concurrency:
-  group: ecs-main
+  group: ecs-develop  # 🔥 concurrency group도 develop으로 변경
   cancel-in-progress: false
 
 permissions:
@@ -24,18 +24,41 @@ env:
 jobs:
   deploy:
     # ECR 워크플로우가 '성공'할 때만 실행 (브랜치 조건 제거)
-    if: ${{ github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
     env:
       HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
 
     steps:
+      # 🔥 디버깅: workflow_run 이벤트 정보 확인
+      - name: Debug workflow_run event
+        run: |
+          echo "=== Workflow Run Event Debug ==="
+          echo "Conclusion: ${{ github.event.workflow_run.conclusion }}"
+          echo "Head Branch: ${{ github.event.workflow_run.head_branch }}"
+          echo "Head SHA: ${{ github.event.workflow_run.head_sha }}"
+          echo "Event: ${{ github.event.workflow_run.event }}"
+          echo "Workflow Name: ${{ github.event.workflow_run.name }}"
+          echo "Workflow ID: ${{ github.event.workflow_run.id }}"
+
+      # 🔥 조건 확인
+      - name: Check if should deploy
+        id: should_deploy
+        run: |
+          if [ "${{ github.event.workflow_run.conclusion }}" = "success" ]; then
+            echo "✅ ECR workflow was successful - proceeding with deployment"
+            echo "SHOULD_DEPLOY=true" >> $GITHUB_OUTPUT
+          else
+            echo "❌ ECR workflow failed (conclusion: ${{ github.event.workflow_run.conclusion }}) - skipping deployment"
+            echo "SHOULD_DEPLOY=false" >> $GITHUB_OUTPUT
+          fi
       - name: Checkout same commit (from ECR build)
+        if: steps.should_deploy.outputs.SHOULD_DEPLOY == 'true'
         uses: actions/checkout@v4
         with:
           ref: ${{ env.HEAD_SHA }}
 
       - name: Configure AWS credentials (Access Keys)
+        if: steps.should_deploy.outputs.SHOULD_DEPLOY == 'true'
         uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
@@ -49,13 +72,16 @@ jobs:
       - name: Install jq
         run: sudo apt-get update && sudo apt-get install -y jq
 
-      # ECR에서 사용한 것과 동일한 태그(HEAD_SHA 12자리)로 이미지 URI를 재구성
+      # ECR에서 사용한 것과 동일한 태그 (GITHUB_SHA 12자리)로 이미지 URI를 재구성
       - name: Compute IMAGE_URI (same tag as ECR)
         id: tag
         run: |
-          TAG=${HEAD_SHA::12}
+          # ECR에서 GITHUB_SHA를 사용했으므로 동일하게 사용
+          TAG=${GITHUB_SHA::12}
           echo "TAG=$TAG" >> $GITHUB_OUTPUT
           echo "IMAGE_URI=${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${TAG}" >> $GITHUB_OUTPUT
+          echo "Using SHA: ${GITHUB_SHA}"
+          echo "Tag: $TAG"
 
       - name: Describe current Task Definition
         run: |
