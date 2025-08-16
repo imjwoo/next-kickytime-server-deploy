@@ -1,0 +1,67 @@
+name: ECR - Build & Push (develop)
+
+on:
+  push:
+    branches: [develop]
+  workflow_dispatch:
+
+concurrency:
+  group: ecr-${{ github.ref_name }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  AWS_REGION: ap-northeast-2
+  ECR_REPOSITORY: kickytime-repo
+
+jobs:
+  build_and_push:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # 액세스 키 방식
+      - name: Configure AWS credentials (Access Keys)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set TAG
+        id: tag
+        run: echo "TAG=${GITHUB_SHA::12}" >> $GITHUB_OUTPUT
+
+      - name: Build & Push image
+        run: |
+          set -e
+          REGISTRY="${{ steps.ecr.outputs.registry }}"
+          TAG="${{ steps.tag.outputs.TAG }}"
+          IMAGE_URI="$REGISTRY/${{ env.ECR_REPOSITORY }}:$TAG"
+
+          echo "Building $IMAGE_URI"
+          docker build -t "$IMAGE_URI" .
+
+          echo "Pushing $IMAGE_URI"
+          docker push "$IMAGE_URI"
+
+          echo "Tagging latest"
+          docker tag "$IMAGE_URI" "$REGISTRY/${{ env.ECR_REPOSITORY }}:latest"
+          docker push "$REGISTRY/${{ env.ECR_REPOSITORY }}:latest"
+
+          echo "IMAGE_URI=$IMAGE_URI" >> $GITHUB_OUTPUT
+          echo "Pushed image: $IMAGE_URI"
+
+      - name: Summary
+        run: |
+          echo "### ✅ ECR Push Completed" >> $GITHUB_STEP_SUMMARY
+          echo "- Repo: \`${{ env.ECR_REPOSITORY }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- Tag: \`${{ steps.tag.outputs.TAG }}\`" >> $GITHUB_STEP_SUMMARY
