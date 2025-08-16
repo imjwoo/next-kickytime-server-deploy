@@ -51,9 +51,6 @@ jobs:
           IMAGE_URI="$REGISTRY/${{ env.ECR_REPOSITORY }}:$TAG"
           LATEST_URI="$REGISTRY/${{ env.ECR_REPOSITORY }}:latest"
 
-          echo "Building ARM64 image: $IMAGE_URI (commit=${GITHUB_SHA})"
-          echo "Branch: ${{ github.ref_name }}"
-          
           docker buildx build \
             --platform linux/arm64 \
             --push \
@@ -62,26 +59,16 @@ jobs:
             .
 
           echo "IMAGE_URI=$IMAGE_URI" >> $GITHUB_OUTPUT
-          echo "Successfully built and pushed ARM64 image"
 
       - name: Verify ARM64 architecture
         run: |
           REGISTRY="${{ steps.ecr.outputs.registry }}"
           TAG="${{ steps.tag.outputs.TAG }}"
           IMAGE_URI="$REGISTRY/${{ env.ECR_REPOSITORY }}:$TAG"
-          
-          echo "=== Verifying image architecture ==="
-          docker manifest inspect "$IMAGE_URI" | grep -A 10 '"architecture"'
-          
           ARCH=$(docker manifest inspect "$IMAGE_URI" | jq -r '.manifests[0].platform.architecture // .architecture')
-          if [ "$ARCH" = "arm64" ]; then
-            echo "✅ Confirmed: Image is ARM64"
-          else
-            echo "❌ Error: Image architecture is $ARCH, expected arm64"
-            exit 1
-          fi
+          [ "$ARCH" = "arm64" ] || (echo "Expected arm64, got $ARCH" && exit 1)
 
-      # ✅ ECS 배포 트리거(repository_dispatch) 전송 + HTTP 204 확인
+      # repository_dispatch 전송 + HTTP 204 확인
       - name: Trigger ECS Deploy via repository_dispatch
         if: success()
         run: |
@@ -91,32 +78,17 @@ jobs:
           branch="${{ github.ref_name }}"
           sha="${{ github.sha }}"
 
-          echo "Dispatching deploy-ecs with:"
-          echo " - image_uri=$image_uri"
-          echo " - tag=$tag"
-          echo " - branch=$branch"
-          echo " - sha=$sha"
-
           resp=$(curl -s -o /tmp/resp.txt -w "%{http_code}" -X POST \
             "https://api.github.com/repos/${{ github.repository }}/dispatches" \
             -H "Accept: application/vnd.github+json" \
             -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
             -d "{\"event_type\":\"deploy-ecs\",\"client_payload\":{\"image_uri\":\"$image_uri\",\"tag\":\"$tag\",\"branch\":\"$branch\",\"sha\":\"$sha\"}}")
-
-          echo "HTTP: $resp"
-          if [ "$resp" != "204" ]; then
-            echo "Body:"
-            cat /tmp/resp.txt
-            exit 1
-          fi
+          [ "$resp" = "204" ] || (cat /tmp/resp.txt && exit 1)
 
       - name: Summary
         run: |
-          echo "### ✅ ECR Push Completed (ARM64)" >> $GITHUB_STEP_SUMMARY
-          echo "- Repo: \`${{ env.ECR_REPOSITORY }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "- Tag: \`${{ steps.tag.outputs.TAG }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "- Commit: \`${GITHUB_SHA}\`" >> $GITHUB_STEP_SUMMARY
-          echo "- Branch: \`${{ github.ref_name }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "- Platform: \`linux/arm64\`" >> $GITHUB_STEP_SUMMARY
+          echo "### ✅ ECR Push & Dispatch OK" >> $GITHUB_STEP_SUMMARY
+          echo "- Repo:  \`${{ env.ECR_REPOSITORY }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- Tag:   \`${{ steps.tag.outputs.TAG }}\`" >> $GITHUB_STEP_SUMMARY
           echo "- Image: \`${{ steps.build.outputs.IMAGE_URI }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "- Triggered: \`repository_dispatch: deploy-ecs\`" >> $GITHUB_STEP_SUMMARY
+          echo "- Sent:  \`repository_dispatch: deploy-ecs\`" >> $GITHUB_STEP_SUMMARY

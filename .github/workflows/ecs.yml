@@ -21,25 +21,7 @@ env:
   CONTAINER_NAME: kickytime-ecr
 
 jobs:
-  info:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Show context & payload
-        run: |
-          echo "== GitHub context =="
-          echo "event        : ${{ github.event_name }}"
-          echo "repo         : ${{ github.repository }}"
-          echo "ref          : ${{ github.ref }}"
-          echo "sha(context) : ${{ github.sha }}"
-          echo ""
-          echo "== Payload (client_payload) =="
-          echo "image_uri: ${{ github.event.client_payload.image_uri }}"
-          echo "tag      : ${{ github.event.client_payload.tag }}"
-          echo "branch   : ${{ github.event.client_payload.branch }}"
-          echo "sha      : ${{ github.event.client_payload.sha }}"
-
   deploy:
-    needs: info
     runs-on: ubuntu-latest
     env:
       PAYLOAD_IMAGE_URI: ${{ github.event.client_payload.image_uri }}
@@ -48,22 +30,14 @@ jobs:
       PAYLOAD_SHA:       ${{ github.event.client_payload.sha }}
 
     steps:
-      - name: Debug payload
-        run: |
-          echo "image_uri: $PAYLOAD_IMAGE_URI"
-          echo "tag      : $PAYLOAD_TAG"
-          echo "branch   : $PAYLOAD_BRANCH"
-          echo "sha      : $PAYLOAD_SHA"
-
       - name: Gate - only deploy for develop
         id: gate
         run: |
           if [ "$PAYLOAD_BRANCH" = "develop" ]; then
             echo "GO=true" >> $GITHUB_OUTPUT
-            echo "✅ Proceeding with deploy for branch: $PAYLOAD_BRANCH"
           else
             echo "GO=false" >> $GITHUB_OUTPUT
-            echo "⛔ Skipping deploy (branch=$PAYLOAD_BRANCH)"
+            echo "Non-deploy branch: $PAYLOAD_BRANCH"
           fi
 
       - name: Checkout (same commit as build)
