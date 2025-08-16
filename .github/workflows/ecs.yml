@@ -2,7 +2,7 @@ name: ECS - Deploy
 
 on:
   workflow_run:
-    workflows: ["ECR - Build & Push"]  # ← ECR 워크플로우 'name' 정확히 입력
+    workflows: ["ECR - Build & Push"]
     types: [completed]
   workflow_dispatch:
 
@@ -20,6 +20,9 @@ env:
   ECS_SERVICE: kickytime-task-service   # ECS 서비스 이름
   TASK_FAMILY: kickytime-task           # 태스크 정의 패밀리
   CONTAINER_NAME: kickytime-ecr         # TD 안 컨테이너 이름(정확히 일치)
+  # (선택) ALB 타겟그룹 ARN을 Secret에 넣었다면 아래처럼 꺼내 쓰세요.
+  # TG_ARN은 디버깅용으로만 사용합니다.
+  # TG_ARN: ${{ secrets.ALB_TG_ARN }}
 
 jobs:
   deploy:
@@ -56,6 +59,7 @@ jobs:
           TAG=${HEAD_SHA::12}
           echo "TAG=$TAG" >> $GITHUB_OUTPUT
           echo "IMAGE_URI=${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${TAG}" >> $GITHUB_OUTPUT
+          echo "🏷️ Using image: ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${TAG}"
 
       - name: Describe current Task Definition
         run: |
@@ -78,7 +82,7 @@ jobs:
             --query 'taskDefinition.taskDefinitionArn' \
             --output text)
           echo "TASK_DEF_ARN=$NEW_TD_ARN" >> $GITHUB_OUTPUT
-          echo "New TD: $NEW_TD_ARN"
+          echo "✅ New Task Definition: $NEW_TD_ARN"
 
       - name: Update service (rolling deployment)
         run: |
@@ -88,16 +92,94 @@ jobs:
             --task-definition "${{ steps.register.outputs.TASK_DEF_ARN }}" \
             --force-new-deployment
 
-      - name: Wait until service is stable
+      # 🔐 desiredCount가 0이면 모니터링을 스킵 (의도적 0-스케일 테스트 지원)
+      - name: "Guard: skip when desiredCount == 0"
+        id: guard
         run: |
+          DESIRED=$(aws ecs describe-services \
+            --cluster "${{ env.ECS_CLUSTER }}" \
+            --services "${{ env.ECS_SERVICE }}" \
+            --query 'services[0].desiredCount' --output text)
+          echo "desiredCount=$DESIRED"
+          if [ "$DESIRED" = "0" ]; then
+            echo "SKIPPED=true" >> $GITHUB_OUTPUT
+            echo "ℹ️ desiredCount is 0 ⇒ monitoring skipped by design."
+          fi
+
+      # ⏳ 안정화 대기 — 실패를 잡고 넘어가서 디버깅 스텝이 실행되게 함
+      - name: Wait until service is stable (capture failure)
+        id: wait
+        if: steps.guard.outputs.SKIPPED != 'true'
+        run: |
+          set +e
           aws ecs wait services-stable \
             --cluster "${{ env.ECS_CLUSTER }}" \
             --services "${{ env.ECS_SERVICE }}"
+          STATUS=$?
+          echo "WAIT_EXIT=$STATUS" >> $GITHUB_OUTPUT
+          if [ $STATUS -ne 0 ]; then
+            echo "❌ Waiter failed (diagnostics will run next)."
+          else
+            echo "✅ Service stabilized."
+          fi
 
+      # 🧰 실패 원인 덤프 (서비스 이벤트/배포/최근 STOPPED 태스크)
+      - name: Dump ECS service events
+        if: steps.guard.outputs.SKIPPED != 'true' && steps.wait.outputs.WAIT_EXIT != '0'
+        run: |
+          aws ecs describe-services \
+            --cluster "${{ env.ECS_CLUSTER }}" \
+            --services "${{ env.ECS_SERVICE }}" \
+            --query 'services[0].events[0:20].[createdAt,message]' \
+            --output table
+
+          aws ecs describe-services \
+            --cluster "${{ env.ECS_CLUSTER }}" \
+            --services "${{ env.ECS_SERVICE }}" \
+            --query 'services[0].deployments' \
+            --output json
+
+      - name: Inspect last failed task
+        if: steps.guard.outputs.SKIPPED != 'true' && steps.wait.outputs.WAIT_EXIT != '0'
+        run: |
+          ARNS=$(aws ecs list-tasks \
+            --cluster "${{ env.ECS_CLUSTER }}" \
+            --service-name "${{ env.ECS_SERVICE }}" \
+            --desired-status STOPPED \
+            --query 'taskArns' --output text)
+          if [ -n "$ARNS" ]; then
+            aws ecs describe-tasks \
+              --cluster "${{ env.ECS_CLUSTER }}" \
+              --tasks $ARNS \
+              --query 'tasks[].{stoppedReason:stoppedReason,containers:containers[].reason,exitCode:containers[].exitCode,lastStatus:lastStatus}' \
+              --output table
+          else
+            echo "No STOPPED tasks found."
+          fi
+
+      # (선택) ALB 타겟그룹 헬스 — TG_ARN을 알고 있을 때만
+      - name: Target group target health (optional)
+        if: steps.guard.outputs.SKIPPED != 'true' && steps.wait.outputs.WAIT_EXIT != '0' && env.TG_ARN != ''
+        run: |
+          aws elbv2 describe-target-health --target-group-arn "${{ env.TG_ARN }}" \
+            --query 'TargetHealthDescriptions[].TargetHealth' --output table || true
+
+      # ❌ 여기서 최종 실패 처리 (위에서 진단 로그를 남긴 후 실패)
+      - name: Fail job (service did not stabilize)
+        if: steps.guard.outputs.SKIPPED != 'true' && steps.wait.outputs.WAIT_EXIT != '0'
+        run: |
+          echo "❌ Service did not stabilize. See diagnostics above."
+          exit 1
+
+      # ✅ 성공 또는 스킵 요약
       - name: Summary
+        if: steps.guard.outputs.SKIPPED == 'true' || steps.wait.outputs.WAIT_EXIT == '0'
         run: |
           echo "### 🚀 ECS Deploy Completed" >> $GITHUB_STEP_SUMMARY
           echo "- Cluster: \`${{ env.ECS_CLUSTER }}\`" >> $GITHUB_STEP_SUMMARY
           echo "- Service: \`${{ env.ECS_SERVICE }}\`" >> $GITHUB_STEP_SUMMARY
           echo "- TD: \`${{ steps.register.outputs.TASK_DEF_ARN }}\`" >> $GITHUB_STEP_SUMMARY
           echo "- Image: \`${{ steps.tag.outputs.IMAGE_URI }}\`" >> $GITHUB_STEP_SUMMARY
+          if [ "${{ steps.guard.outputs.SKIPPED }}" = "true" ]; then
+            echo "- Note: desiredCount=0 (monitoring skipped by design)" >> $GITHUB_STEP_SUMMARY
+          fi
