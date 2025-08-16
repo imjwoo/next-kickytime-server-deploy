@@ -2,7 +2,7 @@ name: ECS - Deploy
 
 on:
   workflow_run:
-    workflows: ["ECR - Build & Push"]
+    workflows: ["ECR - Build & Push"]  # ← ECR 워크플로우 'name' 정확히 입력
     types: [completed]
   workflow_dispatch:
 
@@ -15,26 +15,27 @@ permissions:
 
 env:
   AWS_REGION: ap-northeast-2
-  ECR_REPOSITORY: kickytime-repo
-  ECS_CLUSTER: kickytime-cluster
-  ECS_SERVICE: kickytime-task-service
-  TASK_FAMILY: kickytime-task
-  CONTAINER_NAME: kickytime-ecr
+  ECR_REPOSITORY: kickytime-repo        # ECR 리포 이름
+  ECS_CLUSTER: kickytime-cluster        # ECS 클러스터 이름
+  ECS_SERVICE: kickytime-task-service   # ECS 서비스 이름
+  TASK_FAMILY: kickytime-task           # 태스크 정의 패밀리
+  CONTAINER_NAME: kickytime-ecr         # TD 안 컨테이너 이름(정확히 일치)
 
 jobs:
   deploy:
+    # ECR 워크플로우가 '성공'이고, 대상 브랜치가 main일 때만 실행
     if: ${{ github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_branch == 'main' }}
     runs-on: ubuntu-latest
     env:
       HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
 
     steps:
-      - name: Checkout same commit
+      - name: Checkout same commit (from ECR build)
         uses: actions/checkout@v4
         with:
           ref: ${{ env.HEAD_SHA }}
 
-      - name: Configure AWS credentials
+      - name: Configure AWS credentials (Access Keys)
         uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
@@ -48,42 +49,26 @@ jobs:
       - name: Install jq
         run: sudo apt-get update && sudo apt-get install -y jq
 
-      - name: Compute IMAGE_URI
+      # ECR에서 사용한 것과 동일한 태그(HEAD_SHA 12자리)로 이미지 URI를 재구성
+      - name: Compute IMAGE_URI (same tag as ECR)
         id: tag
         run: |
           TAG=${HEAD_SHA::12}
-          IMAGE_URI=${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${TAG}
           echo "TAG=$TAG" >> $GITHUB_OUTPUT
-          echo "IMAGE_URI=$IMAGE_URI" >> $GITHUB_OUTPUT
-          echo "🏷️ Using image: $IMAGE_URI"
-
-      # 배포 전 상태 확인
-      - name: Check current service status
-        run: |
-          echo "📋 Current service status:"
-          aws ecs describe-services \
-            --cluster "${{ env.ECS_CLUSTER }}" \
-            --services "${{ env.ECS_SERVICE }}" \
-            --query 'services[0].{serviceName:serviceName,status:status,runningCount:runningCount,desiredCount:desiredCount,deployments:deployments[*].{status:status,taskDefinition:taskDefinition}}' \
-            --output table
+          echo "IMAGE_URI=${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${TAG}" >> $GITHUB_OUTPUT
 
       - name: Describe current Task Definition
         run: |
           aws ecs describe-task-definition \
             --task-definition "${{ env.TASK_FAMILY }}" \
             --query 'taskDefinition' > td.json
-          
-          echo "📄 Current Task Definition:"
-          jq -r '.family + ":" + (.revision|tostring)' td.json
 
-      - name: Patch image & strip metadata
+      - name: Patch image & strip metadata (keep env/secrets)
         run: |
           jq --arg NAME "${{ env.CONTAINER_NAME }}" --arg IMG "${{ steps.tag.outputs.IMAGE_URI }}" '
             .containerDefinitions |= map(if .name == $NAME then .image = $IMG else . end)
             | del(.taskDefinitionArn,.revision,.status,.requiresAttributes,.compatibilities,.registeredAt,.registeredBy)
           ' td.json > td-new.json
-          
-          echo "🔧 Updated container image to: ${{ steps.tag.outputs.IMAGE_URI }}"
 
       - name: Register new Task Definition
         id: register
@@ -93,188 +78,26 @@ jobs:
             --query 'taskDefinition.taskDefinitionArn' \
             --output text)
           echo "TASK_DEF_ARN=$NEW_TD_ARN" >> $GITHUB_OUTPUT
-          echo "✅ New Task Definition registered: $NEW_TD_ARN"
+          echo "New TD: $NEW_TD_ARN"
 
-      - name: Update service
-        id: update
+      - name: Update service (rolling deployment)
         run: |
-          echo "🚀 Starting service update..."
           aws ecs update-service \
             --cluster "${{ env.ECS_CLUSTER }}" \
             --service "${{ env.ECS_SERVICE }}" \
             --task-definition "${{ steps.register.outputs.TASK_DEF_ARN }}" \
-            --force-new-deployment \
-            --output table
+            --force-new-deployment
 
-      # 배포 모니터링 (더 자세한 로그와 함께)
-      - name: Monitor deployment progress
-        timeout-minutes: 45
+      - name: Wait until service is stable
         run: |
-          echo "⏳ Monitoring deployment progress..."
-          
-          # 최대 45분 대기 (기본 40분보다 길게)
-          start_time=$(date +%s)
-          max_wait_time=2700  # 45분
-          check_interval=30   # 30초마다 체크
-          
-          while true; do
-            current_time=$(date +%s)
-            elapsed=$((current_time - start_time))
-          
-            if [ $elapsed -gt $max_wait_time ]; then
-              echo "❌ Deployment timeout after 45 minutes"
-              exit 1
-            fi
-          
-            echo "📊 Checking service status (${elapsed}s elapsed)..."
-          
-            # 서비스 상태 확인
-            SERVICE_INFO=$(aws ecs describe-services \
-              --cluster "${{ env.ECS_CLUSTER }}" \
-              --services "${{ env.ECS_SERVICE }}" \
-              --query 'services[0]')
-          
-            RUNNING_COUNT=$(echo "$SERVICE_INFO" | jq -r '.runningCount')
-            DESIRED_COUNT=$(echo "$SERVICE_INFO" | jq -r '.desiredCount')
-            DEPLOYMENT_STATUS=$(echo "$SERVICE_INFO" | jq -r '.deployments[0].status')
-          
-            echo "  Running: $RUNNING_COUNT/$DESIRED_COUNT, Status: $DEPLOYMENT_STATUS"
-          
-            # 실행 중인 태스크들의 헬스체크 상태 확인
-            echo "🏥 Checking task health..."
-            aws ecs list-tasks \
-              --cluster "${{ env.ECS_CLUSTER }}" \
-              --service-name "${{ env.ECS_SERVICE }}" \
-              --query 'taskArns' --output text | tr '\t' '\n' | head -3 | while read task_arn; do
-              if [ -n "$task_arn" ]; then
-                TASK_INFO=$(aws ecs describe-tasks \
-                  --cluster "${{ env.ECS_CLUSTER }}" \
-                  --tasks "$task_arn" \
-                  --query 'tasks[0]')
-          
-                LAST_STATUS=$(echo "$TASK_INFO" | jq -r '.lastStatus')
-                HEALTH_STATUS=$(echo "$TASK_INFO" | jq -r '.healthStatus // "UNKNOWN"')
-                TASK_ID=$(basename "$task_arn")
-          
-                echo "  Task ${TASK_ID}: ${LAST_STATUS} (Health: ${HEALTH_STATUS})"
-          
-                # 태스크가 STOPPED 상태라면 이유 확인
-                if [ "$LAST_STATUS" = "STOPPED" ]; then
-                  STOP_REASON=$(echo "$TASK_INFO" | jq -r '.stoppedReason // "Unknown"')
-                  echo "    Stop reason: $STOP_REASON"
-                fi
-              fi
-            done
-          
-            # 배포 완료 조건 확인
-            if [ "$DEPLOYMENT_STATUS" = "PRIMARY" ] && [ "$RUNNING_COUNT" = "$DESIRED_COUNT" ]; then
-              # 추가로 태스크들이 HEALTHY 상태인지 확인
-              echo "🎯 Deployment appears complete, final health check..."
-              sleep 30  # 30초 더 대기
-          
-              # 최종 상태 재확인
-              FINAL_INFO=$(aws ecs describe-services \
-                --cluster "${{ env.ECS_CLUSTER }}" \
-                --services "${{ env.ECS_SERVICE }}" \
-                --query 'services[0]')
-          
-              FINAL_RUNNING=$(echo "$FINAL_INFO" | jq -r '.runningCount')
-              FINAL_DESIRED=$(echo "$FINAL_INFO" | jq -r '.desiredCount')
-          
-              if [ "$FINAL_RUNNING" = "$FINAL_DESIRED" ]; then
-                echo "✅ Deployment completed successfully!"
-                break
-              fi
-            fi
-          
-            echo "  Waiting ${check_interval}s before next check..."
-            sleep $check_interval
-          done
-
-      # 실패 시 디버깅 정보 수집
-      - name: Collect debug info on failure
-        if: failure()
-        run: |
-          echo "🔍 Collecting debugging information..."
-          
-          echo "=== Service Events ==="
-          aws ecs describe-services \
+          aws ecs wait services-stable \
             --cluster "${{ env.ECS_CLUSTER }}" \
-            --services "${{ env.ECS_SERVICE }}" \
-            --query 'services[0].events[0:10]' \
-            --output table
-          
-          echo "=== Recent Tasks ==="
-          aws ecs list-tasks \
-            --cluster "${{ env.ECS_CLUSTER }}" \
-            --service-name "${{ env.ECS_SERVICE }}" \
-            --max-items 5 \
-            --query 'taskArns' --output text | tr '\t' '\n' | while read task_arn; do
-            if [ -n "$task_arn" ]; then
-              echo "Task: $task_arn"
-              aws ecs describe-tasks \
-                --cluster "${{ env.ECS_CLUSTER }}" \
-                --tasks "$task_arn" \
-                --query 'tasks[0].{lastStatus:lastStatus,healthStatus:healthStatus,stoppedReason:stoppedReason,containers:containers[*].{name:name,lastStatus:lastStatus,reason:reason}}' \
-                --output table
-            fi
-          done
-          
-          echo "=== CloudWatch Logs (Last 20 events) ==="
-          LOG_GROUP="/ecs/${{ env.TASK_FAMILY }}"
-          aws logs describe-log-streams \
-            --log-group-name "$LOG_GROUP" \
-            --order-by LastEventTime \
-            --descending \
-            --limit 1 \
-            --query 'logStreams[0].logStreamName' \
-            --output text > latest_log_stream.txt || echo "No log streams found"
-          
-          if [ -s latest_log_stream.txt ]; then
-            LATEST_STREAM=$(cat latest_log_stream.txt)
-            echo "Latest log stream: $LATEST_STREAM"
-            aws logs get-log-events \
-              --log-group-name "$LOG_GROUP" \
-              --log-stream-name "$LATEST_STREAM" \
-              --limit 20 \
-              --query 'events[*].[timestamp,message]' \
-              --output table || echo "Could not fetch logs"
-          fi
+            --services "${{ env.ECS_SERVICE }}"
 
-      - name: Final deployment summary
-        if: success()
+      - name: Summary
         run: |
-          # 최종 상태 확인
-          FINAL_SERVICE_INFO=$(aws ecs describe-services \
-            --cluster "${{ env.ECS_CLUSTER }}" \
-            --services "${{ env.ECS_SERVICE }}" \
-            --query 'services[0]')
-          
-          RUNNING_COUNT=$(echo "$FINAL_SERVICE_INFO" | jq -r '.runningCount')
-          DESIRED_COUNT=$(echo "$FINAL_SERVICE_INFO" | jq -r '.desiredCount')
-          
-          echo "### 🚀 ECS Deployment Completed" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "| Field | Value |" >> $GITHUB_STEP_SUMMARY
-          echo "|-------|-------|" >> $GITHUB_STEP_SUMMARY
-          echo "| Cluster | \`${{ env.ECS_CLUSTER }}\` |" >> $GITHUB_STEP_SUMMARY
-          echo "| Service | \`${{ env.ECS_SERVICE }}\` |" >> $GITHUB_STEP_SUMMARY
-          echo "| Task Definition | \`${{ steps.register.outputs.TASK_DEF_ARN }}\` |" >> $GITHUB_STEP_SUMMARY
-          echo "| Image | \`${{ steps.tag.outputs.IMAGE_URI }}\` |" >> $GITHUB_STEP_SUMMARY
-          echo "| Running Tasks | ${RUNNING_COUNT}/${DESIRED_COUNT} |" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "✅ Service is stable and ready to serve traffic!"
-
-      - name: Failure summary
-        if: failure()
-        run: |
-          echo "### ❌ ECS Deployment Failed" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "The deployment failed to stabilize within the timeout period." >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**Debugging checklist:**" >> $GITHUB_STEP_SUMMARY
-          echo "- Check ECS service events in AWS Console" >> $GITHUB_STEP_SUMMARY
-          echo "- Verify ALB target group health checks" >> $GITHUB_STEP_SUMMARY
-          echo "- Review CloudWatch logs for application errors" >> $GITHUB_STEP_SUMMARY
-          echo "- Confirm resource requirements (CPU/Memory)" >> $GITHUB_STEP_SUMMARY
-          echo "- Check security group and network configuration" >> $GITHUB_STEP_SUMMARY
+          echo "### 🚀 ECS Deploy Completed" >> $GITHUB_STEP_SUMMARY
+          echo "- Cluster: \`${{ env.ECS_CLUSTER }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- Service: \`${{ env.ECS_SERVICE }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- TD: \`${{ steps.register.outputs.TASK_DEF_ARN }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- Image: \`${{ steps.tag.outputs.IMAGE_URI }}\`" >> $GITHUB_STEP_SUMMARY
