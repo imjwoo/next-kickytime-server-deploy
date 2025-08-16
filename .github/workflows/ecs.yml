@@ -1,4 +1,4 @@
-name: ECS - Deploy
+name: ECS - Deploy (dispatch)
 
 on:
   repository_dispatch:
@@ -21,27 +21,26 @@ env:
   CONTAINER_NAME: kickytime-ecr
 
 jobs:
-  # 🆕 Info 잡
   info:
     runs-on: ubuntu-latest
     steps:
-      - name: Show context
+      - name: Show context & payload
         run: |
           echo "== GitHub context =="
-          echo "event: ${{ github.event_name }}"
-          echo "action: ${{ github.event.action }}"
-          echo "ref   : ${{ github.ref }}"
-          echo "sha   : ${{ github.sha }}"
+          echo "event        : ${{ github.event_name }}"
+          echo "repo         : ${{ github.repository }}"
+          echo "ref          : ${{ github.ref }}"
+          echo "sha(context) : ${{ github.sha }}"
           echo ""
-          echo "== Payload =="
+          echo "== Payload (client_payload) =="
           echo "image_uri: ${{ github.event.client_payload.image_uri }}"
           echo "tag      : ${{ github.event.client_payload.tag }}"
           echo "branch   : ${{ github.event.client_payload.branch }}"
           echo "sha      : ${{ github.event.client_payload.sha }}"
 
   deploy:
+    needs: info
     runs-on: ubuntu-latest
-    needs: info   # Info 잡 끝난 후 실행
     env:
       PAYLOAD_IMAGE_URI: ${{ github.event.client_payload.image_uri }}
       PAYLOAD_TAG:       ${{ github.event.client_payload.tag }}
@@ -56,7 +55,6 @@ jobs:
           echo "branch   : $PAYLOAD_BRANCH"
           echo "sha      : $PAYLOAD_SHA"
 
-      # (선택) 브랜치 가드: develop일 때만 배포
       - name: Gate - only deploy for develop
         id: gate
         run: |
@@ -68,7 +66,6 @@ jobs:
             echo "⛔ Skipping deploy (branch=$PAYLOAD_BRANCH)"
           fi
 
-      # (선택) 동일 커밋 체크아웃이 필요하면 활성화
       - name: Checkout (same commit as build)
         if: steps.gate.outputs.GO == 'true'
         uses: actions/checkout@v4
@@ -95,7 +92,6 @@ jobs:
             --task-definition "${{ env.TASK_FAMILY }}" \
             --query 'taskDefinition' > td.json
 
-      # ARM64 보장 + 컨테이너 이미지 교체 (payload의 image_uri 사용)
       - name: Patch image & ensure ARM64 platform
         if: steps.gate.outputs.GO == 'true'
         run: |
@@ -114,7 +110,6 @@ jobs:
             --query 'taskDefinition.taskDefinitionArn' \
             --output text)
           echo "TASK_DEF_ARN=$NEW_TD_ARN" >> $GITHUB_OUTPUT
-          echo "New TD: $NEW_TD_ARN"
 
       - name: Update service (rolling deployment)
         if: steps.gate.outputs.GO == 'true'
@@ -134,16 +129,6 @@ jobs:
             --cluster "${{ env.ECS_CLUSTER }}" \
             --services "${{ env.ECS_SERVICE }}" || echo "WAIT_FAILED=true" >> $GITHUB_OUTPUT
 
-      - name: Debug on failure
-        if: steps.gate.outputs.GO == 'true' && steps.wait.outputs.WAIT_FAILED == 'true'
-        run: |
-          echo "🔍 Deployment failed, collecting debug info..."
-          aws ecs describe-services --cluster "${{ env.ECS_CLUSTER }}" --services "${{ env.ECS_SERVICE }}"
-          aws ecs list-tasks --cluster "${{ env.ECS_CLUSTER }}" --service-name "${{ env.ECS_SERVICE }}" \
-            --max-items 5 --query 'taskArns[]' --output text | \
-          xargs -I {} aws ecs describe-tasks --cluster "${{ env.ECS_CLUSTER }}" --tasks {} \
-            --query 'tasks[0].{TaskArn:taskArn,LastStatus:lastStatus,HealthStatus:healthStatus,StoppedReason:stoppedReason,Platform:runtimePlatform}'
-
       - name: Summary
         if: steps.gate.outputs.GO == 'true'
         run: |
@@ -152,8 +137,8 @@ jobs:
             exit 1
           else
             echo "### ✅ ECS Deploy Completed (ARM64)" >> $GITHUB_STEP_SUMMARY
-            echo "- Cluster: \`${{ env.ECS_CLUSTER }}\`" >> $GITHUB_STEP_SUMMARY
-            echo "- Service: \`${{ env.ECS_SERVICE }}\`" >> $GITHUB_STEP_SUMMARY
-            echo "- TD: \`${{ steps.register.outputs.TASK_DEF_ARN }}\`" >> $GITHUB_STEP_SUMMARY
-            echo "- Image: \`${PAYLOAD_IMAGE_URI}\`" >> $GITHUB_STEP_SUMMARY
+            echo "- Cluster: \`${{ env.ECS_CLUSTER }}\`"
+            echo "- Service: \`${{ env.ECS_SERVICE }}\`"
+            echo "- TD: \`${{ steps.register.outputs.TASK_DEF_ARN }}\`"
+            echo "- Image: \`${PAYLOAD_IMAGE_URI}\`"
           fi
