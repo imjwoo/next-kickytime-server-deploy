@@ -3,7 +3,7 @@ name: ECR - Build & Push
 on:
   # 🔥 CI 워크플로우 대신 직접 push/PR 이벤트 사용
   push:
-    branches: [develop]  # develop 브랜치에만!
+#    branches: [develop]
   workflow_dispatch:
 
 concurrency:
