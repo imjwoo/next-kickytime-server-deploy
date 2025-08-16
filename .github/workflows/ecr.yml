@@ -1,12 +1,13 @@
-name: ECR - Build & Push (develop)
+name: ECR - Build & Push (after CI on main)
 
 on:
-  push:
-    branches: [main]
+  workflow_run:
+    workflows: ["ci.yml"]   # ← 여기 'CI 워크플로우의 name'을 정확히 넣어줘
+    types: [completed]
   workflow_dispatch:
 
 concurrency:
-  group: ecr-${{ github.ref_name }}
+  group: ecr-main
   cancel-in-progress: false
 
 permissions:
@@ -18,13 +19,18 @@ env:
 
 jobs:
   build_and_push:
+    # CI 성공 + 대상 브랜치가 main일 때만 실행
+    if: ${{ github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_branch == 'main' }}
     runs-on: ubuntu-latest
+    env:
+      HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
 
     steps:
-      - name: Checkout
+      - name: Checkout target commit (from CI)
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
 
-      # 액세스 키 방식
       - name: Configure AWS credentials (Access Keys)
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -36,9 +42,9 @@ jobs:
         id: ecr
         uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Set TAG
+      - name: Set TAG from head_sha
         id: tag
-        run: echo "TAG=${GITHUB_SHA::12}" >> $GITHUB_OUTPUT
+        run: echo "TAG=${HEAD_SHA::12}" >> $GITHUB_OUTPUT
 
       - name: Build & Push image
         run: |
@@ -47,7 +53,7 @@ jobs:
           TAG="${{ steps.tag.outputs.TAG }}"
           IMAGE_URI="$REGISTRY/${{ env.ECR_REPOSITORY }}:$TAG"
 
-          echo "Building $IMAGE_URI"
+          echo "Building $IMAGE_URI (commit=$HEAD_SHA)"
           docker build -t "$IMAGE_URI" .
 
           echo "Pushing $IMAGE_URI"
@@ -58,10 +64,10 @@ jobs:
           docker push "$REGISTRY/${{ env.ECR_REPOSITORY }}:latest"
 
           echo "IMAGE_URI=$IMAGE_URI" >> $GITHUB_OUTPUT
-          echo "Pushed image: $IMAGE_URI"
 
       - name: Summary
         run: |
           echo "### ✅ ECR Push Completed" >> $GITHUB_STEP_SUMMARY
           echo "- Repo: \`${{ env.ECR_REPOSITORY }}\`" >> $GITHUB_STEP_SUMMARY
           echo "- Tag: \`${{ steps.tag.outputs.TAG }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- Commit: \`${{ env.HEAD_SHA }}\`" >> $GITHUB_STEP_SUMMARY
