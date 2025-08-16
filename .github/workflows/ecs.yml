@@ -23,8 +23,8 @@ env:
 
 jobs:
   deploy:
-    # ECR 워크플로우가 '성공'이고, 대상 브랜치가 main일 때만 실행
-    if: ${{ github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_branch == 'develop' }}
+    # ECR 워크플로우가 '성공'할 때만 실행 (브랜치 조건 제거)
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
     env:
       HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
