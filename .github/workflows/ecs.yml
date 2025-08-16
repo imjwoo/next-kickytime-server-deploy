@@ -1,0 +1,103 @@
+name: ECS - Deploy
+
+on:
+  workflow_run:
+    workflows: ["ECR - Build & Push"]  # ← ECR 워크플로우 'name' 정확히 입력
+    types: [completed]
+  workflow_dispatch:
+
+concurrency:
+  group: ecs-main
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  AWS_REGION: ap-northeast-2
+  ECR_REPOSITORY: kickytime-repo        # ECR 리포 이름
+  ECS_CLUSTER: kickytime-cluster        # ECS 클러스터 이름
+  ECS_SERVICE: kickytime-task-service   # ECS 서비스 이름
+  TASK_FAMILY: kickytime-task           # 태스크 정의 패밀리
+  CONTAINER_NAME: kickytime-ecr         # TD 안 컨테이너 이름(정확히 일치)
+
+jobs:
+  deploy:
+    # ECR 워크플로우가 '성공'이고, 대상 브랜치가 main일 때만 실행
+    if: ${{ github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_branch == 'main' }}
+    runs-on: ubuntu-latest
+    env:
+      HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+
+    steps:
+      - name: Checkout same commit (from ECR build)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.HEAD_SHA }}
+
+      - name: Configure AWS credentials (Access Keys)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Install jq
+        run: sudo apt-get update && sudo apt-get install -y jq
+
+      # ECR에서 사용한 것과 동일한 태그(HEAD_SHA 12자리)로 이미지 URI를 재구성
+      - name: Compute IMAGE_URI (same tag as ECR)
+        id: tag
+        run: |
+          TAG=${HEAD_SHA::12}
+          echo "TAG=$TAG" >> $GITHUB_OUTPUT
+          echo "IMAGE_URI=${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${TAG}" >> $GITHUB_OUTPUT
+
+      - name: Describe current Task Definition
+        run: |
+          aws ecs describe-task-definition \
+            --task-definition "${{ env.TASK_FAMILY }}" \
+            --query 'taskDefinition' > td.json
+
+      - name: Patch image & strip metadata (keep env/secrets)
+        run: |
+          jq --arg NAME "${{ env.CONTAINER_NAME }}" --arg IMG "${{ steps.tag.outputs.IMAGE_URI }}" '
+            .containerDefinitions |= map(if .name == $NAME then .image = $IMG else . end)
+            | del(.taskDefinitionArn,.revision,.status,.requiresAttributes,.compatibilities,.registeredAt,.registeredBy)
+          ' td.json > td-new.json
+
+      - name: Register new Task Definition
+        id: register
+        run: |
+          NEW_TD_ARN=$(aws ecs register-task-definition \
+            --cli-input-json file://td-new.json \
+            --query 'taskDefinition.taskDefinitionArn' \
+            --output text)
+          echo "TASK_DEF_ARN=$NEW_TD_ARN" >> $GITHUB_OUTPUT
+          echo "New TD: $NEW_TD_ARN"
+
+      - name: Update service (rolling deployment)
+        run: |
+          aws ecs update-service \
+            --cluster "${{ env.ECS_CLUSTER }}" \
+            --service "${{ env.ECS_SERVICE }}" \
+            --task-definition "${{ steps.register.outputs.TASK_DEF_ARN }}" \
+            --force-new-deployment
+
+      - name: Wait until service is stable
+        run: |
+          aws ecs wait services-stable \
+            --cluster "${{ env.ECS_CLUSTER }}" \
+            --services "${{ env.ECS_SERVICE }}"
+
+      - name: Summary
+        run: |
+          echo "### 🚀 ECS Deploy Completed" >> $GITHUB_STEP_SUMMARY
+          echo "- Cluster: \`${{ env.ECS_CLUSTER }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- Service: \`${{ env.ECS_SERVICE }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- TD: \`${{ steps.register.outputs.TASK_DEF_ARN }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- Image: \`${{ steps.tag.outputs.IMAGE_URI }}\`" >> $GITHUB_STEP_SUMMARY
